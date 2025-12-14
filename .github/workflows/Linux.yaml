@@ -1,69 +1,109 @@
-name: Linux NoMachine RDP
+name: ubuntu latest
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
-  linux-nomachine-setup:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+  kde-desktop:
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Show disks
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up /mnt storage
         run: |
-          df -h
+          sudo mkdir -p /mnt/storage
+          sudo chmod 777 /mnt/storage
+          mkdir -p /mnt/storage/android-sdk
+          mkdir -p /mnt/storage/android-avd
           df -h /mnt
 
-      - name: Prepare /mnt workspace
+      - name: Enable KVM
         run: |
-          sudo mkdir -p /mnt/workspace
-          sudo chown $USER:$USER /mnt/workspace
-          echo "WORKSPACE=/mnt/workspace" >> $GITHUB_ENV
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ls -la /dev/kvm
 
-      - name: Install desktop environment
+      - name: Install KDE Plasma Desktop
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies \
-            dbus-x11 x11-xserver-utils \
-            xvfb xauth
+            kde-plasma-desktop plasma-nm konsole dolphin kate firefox \
+            dbus-x11 fonts-noto-color-emoji wget curl net-tools htop \
+            openjdk-17-jdk unzip cpu-checker xrdp
+          echo "✅ KDE + xRDP installed"
 
-      - name: Install NoMachine
+      - name: Configure runner user & KDE session
         run: |
-          cd /tmp
-          VER=8.11.3_4
-          wget https://download.nomachine.com/download/${VER%.*}/Linux/nomachine_${VER}_amd64.deb
-          file nomachine_${VER}_amd64.deb
-          sudo dpkg -i nomachine_${VER}_amd64.deb || sudo apt-get install -f -y
-          echo "✅ NoMachine installed"
+          echo "runner:github2024" | sudo chpasswd
 
-      - name: Configure virtual display
-        run: |
-          export DISPLAY=:0
-          Xvfb :0 -screen 0 1920x1080x24 &
-          sleep 5
-          DISPLAY=:0 nohup startxfce4 &
-          sleep 10
-          sudo /usr/NX/bin/nxserver --restart
+          # Make KDE the default X session for xRDP
+          echo "startplasma-x11" > ~/.xsession
+          chmod +x ~/.xsession
 
-      - name: Create NoMachine user
+          # Disable KDE screen locker for smoother RDP
+          mkdir -p ~/.config
+          cat > ~/.config/kscreenlockerrc << 'EOF'
+          [Daemon]
+          Autolock=false
+          LockOnResume=false
+          Timeout=0
+          EOF
+
+          echo "✅ User and KDE session configured"
+
+      - name: Install Android SDK
         run: |
-          PASSWORD=$(openssl rand -base64 16)
-          sudo useradd -m -s /bin/bash nomachine
-          echo "nomachine:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo nomachine
-          echo "NOMACHINE_USER=nomachine" >> $GITHUB_ENV
-          echo "NOMACHINE_PASS=$PASSWORD" >> $GITHUB_ENV
+          cd /mnt/storage/android-sdk
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+          unzip -q cmdtools.zip
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/ 2>/dev/null || true
+          rm -f cmdtools.zip
+
+          export ANDROID_HOME=/mnt/storage/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+
+          yes | cmdline-tools/latest/bin/sdkmanager --licenses
+          cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+            "emulator" "system-images;android-34;google_apis;x86_64"
+          echo "✅ SDK installed"
+
+      - name: Download Android Studio
+        run: |
+          cd /mnt/storage
+          wget -q https://dl.google.com/android/studio/ide-zips/2025.2.1.7/android-studio-2025.2.1.7-linux.tar.gz -O android-studio.tar.gz || exit 0
+          tar -xzf android-studio.tar.gz 2>/dev/null || true
+          rm -f android-studio.tar.gz
+          echo "✅ Android Studio Otter 2025.2.1 ready"
+
+      - name: Setup Android env
+        run: |
+          mkdir -p ~/.profile.d
+          cat > ~/.profile.d/android.sh << 'EOF'
+          export ANDROID_HOME=/mnt/storage/android-sdk
+          export ANDROID_SDK_ROOT=/mnt/storage/android-sdk
+          export ANDROID_AVD_HOME=/mnt/storage/android-avd
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator
+          EOF
+          echo "✅ Android env file created"
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
+          echo "✅ Tailscale installed"
 
-      - name: Connect to Tailscale
+      - name: Authenticate Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=gh-linux-nomachine-${{ github.run_id }} \
-            --accept-routes
+          sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --accept-routes --accept-dns
           sleep 5
           TAILSCALE_IP=$(tailscale ip -4)
           if [ -z "$TAILSCALE_IP" ]; then
@@ -71,17 +111,53 @@ jobs:
             exit 1
           fi
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP: $TAILSCALE_IP"
+
+      - name: Configure and start xRDP
+        run: |
+          # Ensure xRDP uses Xorg and runner user session
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          # Allow RDP if ufw is enabled
+          sudo ufw allow 3389/tcp || true
+
+          sudo systemctl status xrdp --no-pager || true
+          echo "✅ xRDP running"
 
       - name: Display connection info
         run: |
-          echo "IP: $TAILSCALE_IP"
-          echo "User: $NOMACHINE_USER"
-          echo "Pass: $NOMACHINE_PASS"
-          echo "Workspace: $WORKSPACE"
-          df -h /mnt
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  ⚡ LOW-LATENCY REMOTE DESKTOP (RDP)     ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "║  Tailscale IP: $(tailscale ip -4)       ║"
+          echo "║  RDP Port:    3389                      ║"
+          echo "║  User:        runner                    ║"
+          echo "║  Password:    github2024                ║"
+          echo "║  Desktop:     KDE Plasma (X11)          ║"
+          echo "║  SDK path:    /mnt/storage/android-sdk  ║"
+          echo "║  AVD path:    /mnt/storage/android-avd  ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo
+          echo "Connect from Windows/macOS/Linux via RDP client to:"
+          echo "  $(tailscale ip -4):3389"
 
-      - name: Keep session alive
+      - name: Keep Alive
         run: |
+          echo "=== SESSION ACTIVE (RDP over Tailscale) ==="
           while true; do
-            sleep 300
+            # Ensure xRDP is running
+            if ! systemctl is-active --quiet xrdp; then
+              echo "[$(date '+%H:%M:%S')] Restarting xrdp..."
+              sudo systemctl restart xrdp
+            fi
+
+            # Ensure Tailscale is logged in
+            if ! tailscale status | grep -qi "logged in"; then
+              echo "[$(date '+%H:%M:%S')] Reconnecting Tailscale..."
+              sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --accept-routes --accept-dns
+            fi
+
+            echo "[$(date '+%H:%M:%S')] OK | IP: $(tailscale ip -4) | /mnt free: $(df -h /mnt | tail -1 | awk '{print $4}')"
+            sleep 180
           done
