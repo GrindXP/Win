@@ -1,0 +1,167 @@
+name: Linux NoMachine RDP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  linux-nomachine-setup:
+    runs-on: ubuntu-latest  # 4-core, 16GB RAM
+    timeout-minutes: 360
+
+    steps:
+      - name: Maximize Build Disk Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192      # Reserve 8GB for system
+          swap-size-mb: 4096         # 4GB swap
+          temp-reserve-mb: 1024      # Reserve 1GB on /mnt
+          remove-dotnet: 'true'      # Remove .NET (~17GB)
+          remove-android: 'true'     # Remove Android SDK (~11GB)
+          remove-haskell: 'true'     # Remove Haskell (~2.7GB)
+          remove-codeql: 'true'      # Remove CodeQL (~5.4GB)
+          build-mount-path: '/mnt/workspace'
+          
+      - name: Check Available Storage
+        run: |
+          echo "=== Disk Space After Cleanup ==="
+          df -h
+          echo "=== Memory ==="
+          free -h
+          
+      - name: Install Desktop Environment
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies \
+            dbus-x11 x11-xserver-utils \
+            xvfb xauth
+          echo "✅ XFCE Desktop installed"
+          
+      - name: Install NoMachine
+        run: |
+          cd /tmp
+          wget https://download.nomachine.com/download/8.14/Linux/nomachine_8.14.2_1_amd64.deb
+          sudo dpkg -i nomachine_*.deb
+          sudo apt-get install -f -y
+          rm nomachine_*.deb
+          echo "✅ NoMachine installed"
+          
+      - name: Configure Virtual Display for Headless
+        run: |
+          # Generate X authority
+          export COOKIE=$(mcookie)
+          export AUTHFILE=/tmp/Xvfb-0.auth
+          touch $AUTHFILE
+          xauth -f $AUTHFILE add :0 MIT-MAGIC-COOKIE-1 $COOKIE
+          
+          # Start Xvfb virtual framebuffer
+          Xvfb :0 -auth $AUTHFILE -screen 0 1920x1080x24 &
+          export DISPLAY=:0
+          
+          # Wait for X server
+          sleep 5
+          
+          # Start XFCE desktop
+          DISPLAY=:0 nohup startxfce4 &
+          sleep 10
+          
+          # Restart NoMachine to detect the display
+          sudo /usr/NX/bin/nxserver --restart
+          
+          echo "✅ Virtual display configured at 1920x1080"
+          
+      - name: Create NoMachine User
+        run: |
+          # Generate secure password
+          PASSWORD=$(openssl rand -base64 16)
+          
+          # Create user
+          sudo useradd -m -s /bin/bash nomachine
+          echo "nomachine:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo nomachine
+          
+          # Save credentials
+          echo "NOMACHINE_USER=nomachine" >> $GITHUB_ENV
+          echo "NOMACHINE_PASS=$PASSWORD" >> $GITHUB_ENV
+          
+          echo "✅ User 'nomachine' created"
+          
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          echo "✅ Tailscale installed"
+          
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-linux-nomachine-${{ github.run_id }} \
+            --accept-routes
+          
+          # Wait for IP assignment
+          sleep 5
+          TAILSCALE_IP=$(tailscale ip -4)
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "❌ Failed to get Tailscale IP"
+            exit 1
+          fi
+          
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "✅ Tailscale connected: $TAILSCALE_IP"
+          
+      - name: Display Connection Info
+        run: |
+          echo "╔════════════════════════════════════════════════╗"
+          echo "║  🖥️  NoMachine Access Information              ║"
+          echo "╠════════════════════════════════════════════════╣"
+          echo "║  IP Address: $TAILSCALE_IP                     ║"
+          echo "║  Protocol:   NX (Port 4000)                    ║"
+          echo "║  Username:   $NOMACHINE_USER                   ║"
+          echo "║  Password:   $NOMACHINE_PASS                   ║"
+          echo "╠════════════════════════════════════════════════╣"
+          echo "║  💾 Available Storage:                         ║"
+          df -h /mnt/workspace | tail -1 | awk '{print "║  " $4 " free of " $2 "                         ║"}'
+          echo "║  🧠 RAM: 16GB                                  ║"
+          echo "║  🔧 CPU: 4 cores                               ║"
+          echo "╚════════════════════════════════════════════════╝"
+          echo ""
+          echo "Connect using NoMachine client:"
+          echo "  1. Download from: https://www.nomachine.com/download"
+          echo "  2. Create new connection: $TAILSCALE_IP"
+          echo "  3. Login with credentials above"
+          
+      - name: Keep Runner Alive
+        run: |
+          echo "=== SESSION ACTIVE ==="
+          echo "NoMachine server running on Tailscale network"
+          
+          while true; do
+            # Check NoMachine status
+            if ! pgrep -x "nxserver.bin" > /dev/null; then
+              echo "[$(date '+%H:%M:%S')] Restarting NoMachine..."
+              sudo /usr/NX/bin/nxserver --restart
+            fi
+            
+            # Check Xvfb status
+            if ! pgrep -x "Xvfb" > /dev/null; then
+              echo "[$(date '+%H:%M:%S')] Restarting Xvfb..."
+              export DISPLAY=:0
+              Xvfb :0 -screen 0 1920x1080x24 &
+              sleep 5
+              DISPLAY=:0 nohup startxfce4 &
+            fi
+            
+            # Check Tailscale connection
+            if ! tailscale status | grep -q "logged in"; then
+              echo "[$(date '+%H:%M:%S')] Reconnecting Tailscale..."
+              sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+            fi
+            
+            # Status update
+            echo "[$(date '+%H:%M:%S')] Active | IP: $TAILSCALE_IP | Storage: $(df -h /mnt/workspace | tail -1 | awk '{print $4}') free"
+            
+            sleep 300  # Check every 5 minutes
+          done
+          
