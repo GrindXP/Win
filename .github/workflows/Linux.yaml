@@ -6,7 +6,7 @@ on:
     branches: [ main ]
 
 jobs:
-  kde-desktop:
+  xfce-desktop:
     runs-on: ubuntu-24.04
 
     steps:
@@ -29,33 +29,35 @@ jobs:
           sudo chmod 666 /dev/kvm 2>/dev/null || true
           ls -la /dev/kvm
 
-      - name: Install KDE Plasma Desktop
+      - name: Install Xfce Desktop + xRDP
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            kde-plasma-desktop plasma-nm konsole dolphin kate firefox \
+            xfce4 xfce4-goodies \
             dbus-x11 fonts-noto-color-emoji wget curl net-tools htop \
-            openjdk-17-jdk unzip cpu-checker xrdp
-          echo "✅ KDE + xRDP installed"
+            openjdk-17-jdk unzip cpu-checker xrdp firefox
+          echo "✅ Xfce + xRDP installed"
 
-      - name: Configure runner user & KDE session
+      - name: Configure runner user & Xfce session
         run: |
           echo "runner:github2024" | sudo chpasswd
 
-          # Make KDE the default X session for xRDP
-          echo "startplasma-x11" > ~/.xsession
+          # Make Xfce the default X session for xRDP
+          echo "startxfce4" > ~/.xsession
           chmod +x ~/.xsession
 
-          # Disable KDE screen locker for smoother RDP
-          mkdir -p ~/.config
-          cat > ~/.config/kscreenlockerrc << 'EOF'
-          [Daemon]
-          Autolock=false
-          LockOnResume=false
-          Timeout=0
+          # Disable screen locking to avoid interruptions
+          mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
+          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-session" version="1.0">
+            <property name="general">
+              <property name="LockCommand" type="string" value=""/>
+            </property>
+          </channel>
           EOF
 
-          echo "✅ User and KDE session configured"
+          echo "✅ User and Xfce session configured"
 
       - name: Install Android SDK
         run: |
@@ -115,49 +117,41 @@ jobs:
 
       - name: Configure and start xRDP
         run: |
-          # Ensure xRDP uses Xorg and runner user session
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
-
-          # Allow RDP if ufw is enabled
           sudo ufw allow 3389/tcp || true
-
           sudo systemctl status xrdp --no-pager || true
           echo "✅ xRDP running"
 
       - name: Display connection info
         run: |
+          TS_IP=$(tailscale ip -4)
           echo "╔══════════════════════════════════════════╗"
-          echo "║  ⚡ LOW-LATENCY REMOTE DESKTOP (RDP)     ║"
+          echo "║  ⚡ REMOTE DESKTOP (Xfce + RDP)         ║"
           echo "╠══════════════════════════════════════════╣"
-          echo "║  Tailscale IP: $(tailscale ip -4)       ║"
-          echo "║  RDP Port:    3389                      ║"
-          echo "║  User:        runner                    ║"
-          echo "║  Password:    github2024                ║"
-          echo "║  Desktop:     KDE Plasma (X11)          ║"
-          echo "║  SDK path:    /mnt/storage/android-sdk  ║"
-          echo "║  AVD path:    /mnt/storage/android-avd  ║"
+          echo "║  Tailscale IP: $TS_IP                  ║"
+          echo "║  RDP Port:    3389                     ║"
+          echo "║  User:        runner                   ║"
+          echo "║  Password:    github2024               ║"
+          echo "║  Desktop:     Xfce (X11)               ║"
+          echo "║  SDK path:    /mnt/storage/android-sdk ║"
+          echo "║  AVD path:    /mnt/storage/android-avd ║"
           echo "╚══════════════════════════════════════════╝"
           echo
-          echo "Connect from Windows/macOS/Linux via RDP client to:"
-          echo "  $(tailscale ip -4):3389"
+          echo "Connect from RDP client to:  $TS_IP:3389"
 
       - name: Keep Alive
         run: |
           echo "=== SESSION ACTIVE (RDP over Tailscale) ==="
           while true; do
-            # Ensure xRDP is running
             if ! systemctl is-active --quiet xrdp; then
               echo "[$(date '+%H:%M:%S')] Restarting xrdp..."
               sudo systemctl restart xrdp
             fi
-
-            # Ensure Tailscale is logged in
             if ! tailscale status | grep -qi "logged in"; then
               echo "[$(date '+%H:%M:%S')] Reconnecting Tailscale..."
               sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --accept-routes --accept-dns
             fi
-
             echo "[$(date '+%H:%M:%S')] OK | IP: $(tailscale ip -4) | /mnt free: $(df -h /mnt | tail -1 | awk '{print $4}')"
             sleep 180
           done
