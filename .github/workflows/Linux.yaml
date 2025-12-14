@@ -2,8 +2,6 @@ name: Linux NoMachine RDP
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
 
 jobs:
   linux-nomachine-setup:
@@ -13,9 +11,7 @@ jobs:
     steps:
       - name: Show disks
         run: |
-          echo "=== Disk layout ==="
           df -h
-          echo "=== /mnt details ==="
           df -h /mnt
 
       - name: Prepare /mnt workspace
@@ -23,7 +19,6 @@ jobs:
           sudo mkdir -p /mnt/workspace
           sudo chown $USER:$USER /mnt/workspace
           echo "WORKSPACE=/mnt/workspace" >> $GITHUB_ENV
-          echo "✅ /mnt/workspace ready"
 
       - name: Install desktop environment
         run: |
@@ -32,18 +27,17 @@ jobs:
             xfce4 xfce4-goodies \
             dbus-x11 x11-xserver-utils \
             xvfb xauth
-          echo "✅ XFCE Desktop installed"
 
       - name: Install NoMachine
         run: |
           cd /tmp
-          # Use tar.gz to avoid .deb redirect issues
-          wget https://download.nomachine.com/download/8.14/Linux/nomachine_8.14.2_1_amd64.tar.gz
-          sudo tar xvzf nomachine_8.14.2_1_amd64.tar.gz -C /usr
-          sudo /usr/NX/nxserver --install
+          VER=8.11.3_4
+          wget https://download.nomachine.com/download/${VER%.*}/Linux/nomachine_${VER}_amd64.deb
+          file nomachine_${VER}_amd64.deb
+          sudo dpkg -i nomachine_${VER}_amd64.deb || sudo apt-get install -f -y
           echo "✅ NoMachine installed"
 
-      - name: Configure virtual display (headless)
+      - name: Configure virtual display
         run: |
           export DISPLAY=:0
           Xvfb :0 -screen 0 1920x1080x24 &
@@ -51,7 +45,6 @@ jobs:
           DISPLAY=:0 nohup startxfce4 &
           sleep 10
           sudo /usr/NX/bin/nxserver --restart
-          echo "✅ Virtual display at 1920x1080"
 
       - name: Create NoMachine user
         run: |
@@ -59,66 +52,36 @@ jobs:
           sudo useradd -m -s /bin/bash nomachine
           echo "nomachine:$PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo nomachine
-
           echo "NOMACHINE_USER=nomachine" >> $GITHUB_ENV
           echo "NOMACHINE_PASS=$PASSWORD" >> $GITHUB_ENV
-          echo "✅ User 'nomachine' created"
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          echo "✅ Tailscale installed"
 
       - name: Connect to Tailscale
         run: |
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=gh-linux-nomachine-${{ github.run_id }} \
             --accept-routes
-
           sleep 5
           TAILSCALE_IP=$(tailscale ip -4)
           if [ -z "$TAILSCALE_IP" ]; then
-            echo "❌ Failed to get Tailscale IP"
+            echo "Failed to get Tailscale IP"
             exit 1
           fi
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
-          echo "✅ Tailscale connected: $TAILSCALE_IP"
 
       - name: Display connection info
         run: |
-          echo "╔════════════════════════════════════════════╗"
-          echo "║  🖥️  NoMachine Linux over Tailscale       ║"
-          echo "╠════════════════════════════════════════════╣"
-          echo "║  IP:        $TAILSCALE_IP                 ║"
-          echo "║  Port:      4000 (NX)                     ║"
-          echo "║  User:      $NOMACHINE_USER               ║"
-          echo "║  Password:  $NOMACHINE_PASS               ║"
-          echo "╠════════════════════════════════════════════╣"
-          echo "║  Workspace: $WORKSPACE                    ║"
-          echo "║  /mnt free: $(df -h /mnt | tail -1 | awk '{print $4}')           ║"
-          echo "╚════════════════════════════════════════════╝"
-          echo
-          echo "Use NoMachine client → connect to $TAILSCALE_IP"
+          echo "IP: $TAILSCALE_IP"
+          echo "User: $NOMACHINE_USER"
+          echo "Pass: $NOMACHINE_PASS"
+          echo "Workspace: $WORKSPACE"
+          df -h /mnt
 
       - name: Keep session alive
         run: |
-          echo "=== SESSION ACTIVE ==="
           while true; do
-            if ! pgrep -x "nxserver.bin" >/dev/null; then
-              echo "[$(date '+%H:%M:%S')] Restarting NoMachine..."
-              sudo /usr/NX/bin/nxserver --restart
-            fi
-            if ! pgrep -x "Xvfb" >/dev/null; then
-              echo "[$(date '+%H:%M:%S')] Restarting Xvfb..."
-              export DISPLAY=:0
-              Xvfb :0 -screen 0 1920x1080x24 &
-              sleep 5
-              DISPLAY=:0 nohup startxfce4 &
-            fi
-            if ! tailscale status | grep -qi "logged in"; then
-              echo "[$(date '+%H:%M:%S')] Reconnecting Tailscale..."
-              sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
-            fi
-            echo "[$(date '+%H:%M:%S')] OK | /mnt free: $(df -h /mnt | tail -1 | awk '{print $4}')"
             sleep 300
           done
