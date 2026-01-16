@@ -27,10 +27,8 @@ jobs:
       - name: Setup Google Drive
         shell: powershell
         run: |
-          $configDir = "$env:USERPROFILE\.config\rclone"
-          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-          '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
-          "[gdrive]`ntype = drive`nscope = drive`nservice_account_file = $env:USERPROFILE\gdrive-sa.json" | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+          $configDir = "$env:USERPROFILE\.config\rclone"; New-Item -ItemType Directory -Force -Path $configDir | Out-Null; '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8; "[gdrive]`ntype = drive`nscope = drive`nservice_account_file = $env:USERPROFILE\gdrive-sa.json" | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+
 
       - name: Mount Google Drive
         shell: powershell
