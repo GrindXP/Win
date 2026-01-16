@@ -10,7 +10,7 @@ jobs:
 
     steps:
       - name: Install WinFsp
-        shell: powershell
+        shell: pwsh
         run: |
           $winfspUrl = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
           $installerPath = "$env:TEMP\winfsp.msi"
@@ -20,49 +20,62 @@ jobs:
           Write-Host "WinFsp installed."
 
       - name: Install rclone
-        shell: powershell
+        shell: pwsh
         run: |
           $rcloneUrl = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
           $zipPath = "$env:TEMP\rclone.zip"
+          $extractPath = "$env:TEMP\rclone"
           Invoke-WebRequest -Uri $rcloneUrl -OutFile $zipPath
-          Expand-Archive $zipPath -DestinationPath "$env:TEMP\rclone" -Force
-          Move-Item "$env:TEMP\rclone\rclone-*\rclone.exe" "C:\Windows\System32\" -Force
-          Remove-Item $zipPath, "$env:TEMP\rclone" -Recurse -Force
+          Expand-Archive $zipPath -DestinationPath $extractPath -Force
+
+          $rcloneExe = Get-ChildItem -Path $extractPath -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          if (-not $rcloneExe) { throw "rclone.exe not found after extraction!" }
+
+          Copy-Item $rcloneExe.FullName "C:\Windows\System32\rclone.exe" -Force
+
+          Remove-Item $zipPath -Force
+          Remove-Item $extractPath -Recurse -Force
           Write-Host "rclone installed."
 
       - name: Setup Google Drive (rclone)
-        shell: powershell
+        shell: pwsh
         run: |
           $configDir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
+          # Save service account JSON from secret
           '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
 
-          @"
+          # Build rclone config
+          $rcloneConfig = @"
 [gdrive]
 type = drive
 scope = drive
 service_account_file = $env:USERPROFILE\gdrive-sa.json
-"@ | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+"@
 
-          Write-Host "rclone config created for Google Drive."
+          $rcloneConfig | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+          Write-Host "rclone config created."
 
       - name: Mount Google Drive as G
-        shell: powershell
+        shell: pwsh
         run: |
+          # Start mount in background
           Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full", "--no-console" -WindowStyle Hidden
 
+          # Wait until drive appears
           $retries = 0
-          while ($retries -lt 20) {
-              if (Test-Path "G:\") {
-                  Write-Host "Google Drive mounted as G:"
-                  break
-              }
-              Start-Sleep -Seconds 2
-              $retries++
+          while ($retries -lt 30) {
+            if (Test-Path "G:\") {
+              Write-Host "Google Drive mounted as G:"
+              break
+            }
+            Start-Sleep -Seconds 2
+            $retries++
           }
+
           if (-not (Test-Path "G:\")) {
-              Write-Warning "Google Drive mount may not be ready yet."
+            Write-Warning "Google Drive mount not ready."
           }
 
       - name: Configure Core RDP Settings
@@ -71,8 +84,10 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
           Restart-Service -Name TermService -Force
           Write-Host "RDP enabled."
 
@@ -80,23 +95,37 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
+
           $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
+
           $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
+
           $password = -join ($rawPassword | Sort-Object { Get-Random })
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          # Create user (ignore if already exists)
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
           Write-Host "RDP user created."
 
       - name: Install Tailscale
@@ -113,36 +142,48 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
         shell: pwsh
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-windows-$env:GITHUB_RUN_ID
+
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          while (-not $tsIP -and $retries -lt 15) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
           }
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
-              exit 1
+            Write-Error "Tailscale IP not assigned."
+            exit 1
           }
+
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale connected: $tsIP."
+          Write-Host "Tailscale connected: $tsIP"
 
       - name: Display Access Info
         shell: pwsh
         run: |
-          Write-Host "RDP: $env:TAILSCALE_IP:3389"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS | ForEach-Object { $_.Split('|')[-1].Trim() })"
-          Write-Host "Google Drive mounted at G:\"
+          Write-Host "=========================="
+          Write-Host " RDP ACCESS INFO"
+          Write-Host "=========================="
+          Write-Host "RDP Address : $env:TAILSCALE_IP:3389"
+          Write-Host "Username    : $env:RDP_USERNAME"
+          Write-Host "Password    : $env:RDP_PASSWORD"
+          Write-Host "GDrive      : G:\"
+          Write-Host "=========================="
 
       - name: Maintain Connection
         shell: pwsh
         run: |
           Write-Host "=== RDP SESSION ACTIVE ==="
           while ($true) {
-              $rdpSvc = Get-Service TermService
-              if ($rdpSvc.Status -ne "Running") { Start-Service TermService }
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              if ($tsStatus -notmatch "Logged in") { & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} }
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - RDP: $env:TAILSCALE_IP | GDrive: G:\"
-              Start-Sleep -Seconds 300
+            $rdpSvc = Get-Service TermService
+            if ($rdpSvc.Status -ne "Running") { Start-Service TermService }
+
+            $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+            if ($tsStatus -notmatch "Logged in") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+            }
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - RDP: $env:TAILSCALE_IP | GDrive: G:\"
+            Start-Sleep -Seconds 300
+          }
