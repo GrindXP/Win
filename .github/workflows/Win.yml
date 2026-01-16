@@ -1,4 +1,4 @@
-name: Win
+name: Windows RDP with Google Drive (6 Hours)
 
 on:
   workflow_dispatch:
@@ -6,82 +6,162 @@ on:
 jobs:
   windows-rdp-setup:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # Exactly 6 hours maximum
 
     steps:
-      - name: Install WinFsp
+      - name: Install WinFsp (required for rclone mount)
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "$env:TEMP\winfsp.msi"
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\winfsp.msi`"", "/quiet", "/norestart" -Wait
+          $winfspUrl = "https://github.com/winfsp/winfsp/releases/latest/download/winfsp-latest.msi"
+          $installer = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $winfspUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+          Write-Host "WinFsp installed successfully."
 
       - name: Install rclone
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
-          Expand-Archive "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone"
-          Move-Item "$env:TEMP\rclone\rclone-*\rclone.exe" "C:\Windows\System32\"
+          $rcloneUrl = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          $zipPath = "$env:TEMP\rclone.zip"
+          Invoke-WebRequest -Uri $rcloneUrl -OutFile $zipPath
+          Expand-Archive $zipPath -DestinationPath "$env:TEMP\rclone" -Force
+          $extractedDir = Get-ChildItem -Path "$env:TEMP\rclone" -Directory | Select-Object -First 1
+          Move-Item "$($extractedDir.FullName)\rclone.exe" "C:\Windows\System32\rclone.exe" -Force
+          Remove-Item $zipPath, "$env:TEMP\rclone" -Recurse -Force
+          Write-Host "rclone installed successfully."
 
-      - name: Setup Google Drive
+      - name: Setup Google Drive (rclone config)
+        shell: powershell
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          $configDir = "$env:USERPROFILE\.config\rclone"
+          New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+
+          # Write service account JSON
+          $env:GDRIVE_SA_JSON | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
+
+          # Build config without here-string to completely avoid indentation issues
+          $lines = @(
+            "[gdrive]"
+            "type = drive"
+            "scope = drive"
+            "service_account_file = C:\Users\runneradmin\gdrive-sa.json"
+          )
+          $rcloneConfig = $lines -join "`n"
+
+          $rcloneConfig | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+          Write-Host "Google Drive rclone config created successfully."
+
+      - name: Mount Google Drive as G:
         shell: powershell
         run: |
-          mkdir "$env:USERPROFILE\.config\rclone" -Force
-          '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
-          @"[gdrive]
-          type = drive
-          scope = drive
-          s.ervice_account_file = $env:USERPROFILE\gdrive-sa.json
-          "@ | Out-File -FilePath "$env:USERPROFILE\.config\rclone\rclone.conf" -Encoding utf8
+          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full", "--background", "--log-level", "INFO", "--log-file", "$env:TEMP\rclone-mount.log" -WindowStyle Hidden
 
-      - name: Mount Google Drive
-        shell: powershell
-        run: |
-          rclone mount gdrive: G: --vfs-cache-mode full --background
+          $retries = 0
+          while ($retries -lt 40) {
+            if (Test-Path "G:\") {
+              Write-Host "Google Drive mounted successfully as G:\"
+              Get-ChildItem "G:\" | Select-Object -First 5
+              break
+            }
+            Start-Sleep -Seconds 6
+            $retries++
+          }
+          if (-not (Test-Path "G:\")) {
+            Write-Warning "Mount failed after multiple attempts. Check $env:TEMP\rclone-mount.log"
+          }
 
-      - name: Configure RDP
+      - name: Enable RDP Access
         shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          Restart-Service TermService -Force
+          Write-Host "RDP enabled and firewall rule added."
 
-      - name: Create RDP User
+      - name: Create RDP User with Random Password
         shell: pwsh
         run: |
-          $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | % {[char]$_})
+          $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
+          $password = -join ((1..20) | ForEach-Object { Get-Random -InputObject $chars.ToCharArray() })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+
+          New-LocalUser -Name "RDP" -Password $securePass -FullName "Temporary RDP User" -Description "GitHub Actions RDP" -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "RDP user created with administrator privileges."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+          Write-Host "Tailscale installed."
 
-      - name: Tailscale Connect
+      - name: Connect to Tailscale Network
         shell: pwsh
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-windows-$env:GITHUB_RUN_ID
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if (-not $authKey) {
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing!"
+            exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=gh-rdp-$env:GITHUB_RUN_ID
+
+          $retries = 0
+          $tsIP = $null
+          while ($retries -lt 20 -and -not $tsIP) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 6
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Failed to obtain Tailscale IP."
+            exit 1
+          }
+
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected successfully. IP: $tsIP"
 
-      - name: RDP Info
+      - name: Display Connection Information
         shell: pwsh
         run: |
-          Write-Host "=========================="
-          Write-Host "RDP: $env:TAILSCALE_IP:3389"
-          Write-Host "User: RDP"
-          Write-Host "Pass: $env:RDP_PASSWORD"
-          Write-Host "Drive: G:"
-          Write-Host "=========================="
+          Write-Host "=========================================="
+          Write-Host "     RDP SESSION READY (6 HOURS MAX)     "
+          Write-Host "=========================================="
+          Write-Host "RDP Address  : $($env:TAILSCALE_IP):3389"
+          Write-Host "Username     : RDP"
+          Write-Host "Password     : $($env:RDP_PASSWORD)"
+          Write-Host "Google Drive : G:\ (mounted)"
+          Write-Host "Valid Until  : Up to 6 hours from now"
+          Write-Host "=========================================="
 
-      - name: Keep Alive
+      - name: Keep Session Alive
         shell: pwsh
         run: |
+          Write-Host "Keeping RDP session alive for up to 6 hours..."
           while ($true) {
-            Start-Sleep -Seconds 300
+            if ((Get-Service TermService -ErrorAction SilentlyContinue).Status -ne "Running") {
+              Start-Service TermService
+            }
+
+            $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+            if ($status -notmatch "Logged in") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+            }
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active | RDP: $($env:TAILSCALE_IP):3389 | G:\ mounted"
+            Start-Sleep -Seconds 300  # Update every 5 minutes
           }
