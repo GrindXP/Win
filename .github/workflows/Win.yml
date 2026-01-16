@@ -6,7 +6,7 @@ on:
 jobs:
   windows-rdp-setup:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Install WinFsp
@@ -15,7 +15,7 @@ jobs:
           $winfspUrl = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
           $installerPath = "$env:TEMP\winfsp.msi"
           Invoke-WebRequest -Uri $winfspUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
           Write-Host "WinFsp installed."
 
@@ -30,32 +30,20 @@ jobs:
           Remove-Item $zipPath, "$env:TEMP\rclone" -Recurse -Force
           Write-Host "rclone installed."
 
-      - name: Setup Google Drive (rclone)
+      - name: Setup Google Drive
         shell: powershell
         run: |
           $configDir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-
-          # Save service account JSON from GitHub secret
           '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
-
-          # Build rclone config as here-string
-          $rcloneConfig = @"
-[gdrive]
-type = drive
-scope = drive
-service_account_file = $env:USERPROFILE\gdrive-sa.json
-"@
-
+          $rcloneConfig = "[gdrive]`ntype = drive`nscope = drive`nservice_account_file = $env:USERPROFILE\gdrive-sa.json"
           $rcloneConfig | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
-
           Write-Host "rclone config created for Google Drive."
 
       - name: Mount Google Drive as G
         shell: powershell
         run: |
-          Start-Process -FilePath "rclone" -ArgumentList "mount gdrive: G: --vfs-cache-mode full --no-console" -WindowStyle Hidden
-
+          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full", "--no-console" -WindowStyle Hidden
           $retries = 0
           while ($retries -lt 20) {
               if (Test-Path "G:\") {
@@ -80,7 +68,7 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
           Restart-Service -Name TermService -Force
           Write-Host "RDP enabled."
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
@@ -109,7 +97,7 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
           Write-Host "Tailscale installed."
 
