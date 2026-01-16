@@ -43,27 +43,25 @@ jobs:
           $configDir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-          # Save service account JSON from secret
+          # Save service account JSON from GitHub secret
           '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
 
-          # Build rclone config
-          $rcloneConfig = @"
-[gdrive]
-type = drive
-scope = drive
-service_account_file = $env:USERPROFILE\gdrive-sa.json
-"@
+          # Write rclone config safely (avoid here-string YAML issue)
+          $lines = @(
+            "[gdrive]",
+            "type = drive",
+            "scope = drive",
+            "service_account_file = $env:USERPROFILE\gdrive-sa.json"
+          )
 
-          $rcloneConfig | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
-          Write-Host "rclone config created."
+          $lines -join "`r`n" | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
+          Write-Host "rclone config created for Google Drive."
 
       - name: Mount Google Drive as G
         shell: pwsh
         run: |
-          # Start mount in background
           Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full", "--no-console" -WindowStyle Hidden
 
-          # Wait until drive appears
           $retries = 0
           while ($retries -lt 30) {
             if (Test-Path "G:\") {
@@ -75,7 +73,7 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
           }
 
           if (-not (Test-Path "G:\")) {
-            Write-Warning "Google Drive mount not ready."
+            Write-Warning "Google Drive mount not ready yet."
           }
 
       - name: Configure Core RDP Settings
@@ -113,7 +111,6 @@ service_account_file = $env:USERPROFILE\gdrive-sa.json
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create user (ignore if already exists)
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           } else {
