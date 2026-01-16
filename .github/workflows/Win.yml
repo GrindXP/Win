@@ -12,23 +12,17 @@ jobs:
       - name: Install WinFsp
         shell: powershell
         run: |
-          $winfspUrl = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
-          $installerPath = "$env:TEMP\winfsp.msi"
-          Invoke-WebRequest -Uri $winfspUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "WinFsp installed."
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "$env:TEMP\winfsp.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\winfsp.msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\winfsp.msi" -Force
 
       - name: Install rclone
         shell: powershell
         run: |
-          $rcloneUrl = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
-          $zipPath = "$env:TEMP\rclone.zip"
-          Invoke-WebRequest -Uri $rcloneUrl -OutFile $zipPath
-          Expand-Archive $zipPath -DestinationPath "$env:TEMP\rclone" -Force
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
+          Expand-Archive "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
           Move-Item "$env:TEMP\rclone\rclone-*\rclone.exe" "C:\Windows\System32\" -Force
-          Remove-Item $zipPath, "$env:TEMP\rclone" -Recurse -Force
-          Write-Host "rclone installed."
+          Remove-Item "$env:TEMP\rclone.zip", "$env:TEMP\rclone" -Recurse -Force
 
       - name: Setup Google Drive
         shell: powershell
@@ -36,14 +30,12 @@ jobs:
           $configDir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $configDir | Out-Null
           '${{ secrets.GDRIVE_SA_JSON }}' | Out-File -FilePath "$env:USERPROFILE\gdrive-sa.json" -Encoding utf8
-          $rcloneConfig = "[gdrive]`ntype = drive`nscope = drive`nservice_account_file = $env:USERPROFILE\gdrive-sa.json"
-          $rcloneConfig | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
-          Write-Host "rclone config created for Google Drive."
+          "[gdrive]`ntype = drive`nscope = drive`nservice_account_file = $env:USERPROFILE\gdrive-sa.json" | Out-File -FilePath "$configDir\rclone.conf" -Encoding utf8
 
-      - name: Mount Google Drive as G
+      - name: Mount Google Drive
         shell: powershell
         run: |
-          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full", "--no-console" -WindowStyle Hidden
+          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "G:", "--vfs-cache-mode", "full" -WindowStyle Hidden
           $retries = 0
           while ($retries -lt 20) {
               if (Test-Path "G:\") {
@@ -53,11 +45,8 @@ jobs:
               Start-Sleep -Seconds 2
               $retries++
           }
-          if (-not (Test-Path "G:\")) {
-              Write-Warning "Google Drive mount may not be ready yet."
-          }
 
-      - name: Configure Core RDP Settings
+      - name: Configure RDP
         shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
@@ -66,18 +55,12 @@ jobs:
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "RDP enabled."
 
       - name: Create RDP User
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          $charSet = @{Upper = [char[]](65..90); Lower = [char[]](97..122); Number = [char[]](48..57); Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))}
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
@@ -89,17 +72,13 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          Write-Host "RDP user created."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed."
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\tailscale.msi" -Force
 
       - name: Establish Tailscale Connection
         shell: pwsh
@@ -113,11 +92,9 @@ jobs:
               $retries++
           }
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale connected: $tsIP."
 
       - name: Display Access Info
         shell: pwsh
@@ -125,12 +102,11 @@ jobs:
           Write-Host "RDP: $env:TAILSCALE_IP:3389"
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS | ForEach-Object { $_.Split('|')[-1].Trim() })"
-          Write-Host "Google Drive mounted at G:\"
+          Write-Host "Google Drive: G:\"
 
       - name: Maintain Connection
         shell: pwsh
         run: |
-          Write-Host "=== RDP SESSION ACTIVE ==="
           while ($true) {
               $rdpSvc = Get-Service TermService
               if ($rdpSvc.Status -ne "Running") { Start-Service TermService }
