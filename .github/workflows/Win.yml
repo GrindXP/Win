@@ -72,7 +72,7 @@ jobs:
         rclone lsd gdrive:
         Write-Host "✅ Drive connection OK"
 
-    - name: Mount Google Drive as G:
+    - name: Mount Google Drive as G
       shell: pwsh
       run: |
         Stop-Process -Name rclone -Force -ErrorAction SilentlyContinue
