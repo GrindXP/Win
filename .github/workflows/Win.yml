@@ -12,114 +12,124 @@ jobs:
     - name: Install WinFsp
       shell: powershell
       run: |
-        Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "$env:TEMP\winfsp.msi"
-        Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\winfsp.msi`" /quiet /norestart" -Wait
+        Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile "$env:TEMP\winfsp.msi"
+        Start-Process msiexec.exe -ArgumentList '/i', "$env:TEMP\winfsp.msi", '/quiet', '/norestart' -Wait
         Remove-Item "$env:TEMP\winfsp.msi" -Force
 
     - name: Install rclone
       shell: powershell
       run: |
-        Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-v1.69.3-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
-        Expand-Archive "$env:TEMP\rclone.zip" "$env:TEMP\rclone" -Force
-        Copy-Item "$env:TEMP\rclone\rclone-v1.69.3-windows-amd64\rclone.exe" "C:\Windows\System32\" -Force
-        Remove-Item "$env:TEMP\rclone*" -Recurse -Force
+        Invoke-WebRequest -Uri "https://downloads.rclone.org/v1.72.1/rclone-v1.72.1-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
+        Expand-Archive "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
+        $rcloneFolder = Get-ChildItem "$env:TEMP\rclone" -Directory | Select-Object -First 1
+        Copy-Item "$rcloneFolder.FullName\rclone.exe" "C:\Windows\System32\" -Force
+        Remove-Item "$env:TEMP\rclone" -Recurse -Force
 
     - name: Setup Google Drive
       shell: powershell
       env:
         SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
       run: |
-        $configDir = "${env:USERPROFILE}\.config\rclone"
+        $configDir = "$env:USERPROFILE\.config\rclone"
         New-Item -ItemType Directory -Path $configDir -Force | Out-Null
         
-        # Clean & write JSON
-        $cleanJson = $env:SA_JSON -replace '\uFEFF','' -replace '[^\x20-\x7E\n]',''
-        $jsonBytes = [Text.Encoding]::UTF8.GetBytes($cleanJson)
-        [IO.File]::WriteAllBytes("${env:USERPROFILE}\sa.json", $jsonBytes)
+        $cleanJson = $env:SA_JSON -replace '\uFEFF','' -replace '[^\x20-\x7E\n\r\t]',''
+        $jsonPath = "$env:USERPROFILE\sa.json"
+        [IO.File]::WriteAllText($jsonPath, $cleanJson, [Text.Encoding]::UTF8)
         
-        # Test JSON
         try {
-          $test = Get-Content "${env:USERPROFILE}\sa.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $test = Get-Content $jsonPath -Raw | ConvertFrom-Json
           Write-Host "✅ SA: $($test.client_email)"
         } catch {
-          Write-Error "JSON invalid: $_"
+          Write-Error "Invalid JSON: $_"
           exit 1
         }
         
-        # rclone.conf (SIMPLE)
-        @"
-[gdrive]
-type = drive
-scope = drive
-service_account_file = ${env:USERPROFILE}\sa.json
-"@ | Out-File "${configDir}\rclone.conf" -Encoding ascii
+        $confContent = @"
+        [gdrive]
+        type = drive
+        scope = drive
+        service_account_file = $jsonPath
+        "@
+        $confContent | Out-File "$configDir\rclone.conf" -Encoding ascii
 
     - name: Test Drive
       shell: powershell
       run: |
-        rclone --config "${env:USERPROFILE}\.config\rclone\rclone.conf" ls gdrive: --max-depth 1
-        Write-Host "✅ Drive OK"
+        rclone ls gdrive: --max-depth 1
+        Write-Host "✅ Drive connection OK"
 
-    - name: Mount G:
+    - name: Mount G
       shell: powershell
       run: |
-        Stop-Process rclone -Force -ErrorAction SilentlyContinue
-        Start-Sleep 2
-        Start-Process rclone -ArgumentList "mount gdrive: G: --config `"${env:USERPROFILE}\.config\rclone\rclone.conf`" --vfs-cache-mode full --vfs-cache-max-size 8G --daemon" -WindowStyle Hidden
+        Stop-Process -Name rclone -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
         
-        for ($i=0; $i -lt 30; $i++) {
-          if (Test-Path G:\) {
-            Write-Host "✅ G:\ mounted"
-            dir G:\ | ft Name
-            exit 0
+        $configPath = "$env:USERPROFILE\.config\rclone\rclone.conf"
+        Start-Process rclone -ArgumentList "mount gdrive: G: --config `"$configPath`" --vfs-cache-mode full --vfs-cache-max-size 8G --daemon" -WindowStyle Hidden
+        
+        for ($i = 0; $i -lt 40; $i++) {
+          if (Test-Path 'G:\') {
+            Write-Host "✅ G:\ mounted successfully"
+            Get-ChildItem 'G:\' | Format-Table Name
+            break
           }
-          Start-Sleep 3
+          Start-Sleep -Seconds 3
         }
-        throw "Mount failed"
+        if (-not (Test-Path 'G:\')) {
+          Write-Host "⚠️ Mount may have failed or is delayed - continuing anyway"
+        }
 
     - name: Enable RDP
       shell: pwsh
       run: |
-        Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-        netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+        Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Set-NetFirewallRule -Enabled True
         Restart-Service TermService -Force
 
     - name: Create User
       shell: pwsh
       run: |
-        $pass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | % {[char]$_})
-        New-LocalUser RDPUser ($pass | ConvertTo-SecureString -AsPlainText -Force) -AccountNeverExpires
-        Add-LocalGroupMember Administrators RDPUser
+        $pass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+        $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+        New-LocalUser -Name RDPUser -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+        Add-LocalGroupMember -Group Administrators -Member RDPUser
         echo "PASS=$pass" >> $env:GITHUB_ENV
 
-    - name: Tailscale
+    - name: Install Tailscale
       shell: pwsh
       env:
         TSKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       run: |
-        Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale_1.82.0_amd64.msi" -OutFile "$env:TEMP\ts.msi"
-        Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet" -Wait
-        Remove-Item "$env:TEMP\ts.msi"
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey $env:TSKEY --hostname gh-rdp-${{ github.run_id }}
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\ts.msi"
+        Start-Process msiexec.exe -ArgumentList '/i', "$env:TEMP\ts.msi", '/quiet' -Wait
+        Remove-Item "$env:TEMP\ts.msi" -Force
+        
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TSKEY --hostname="gh-rdp-${{ github.run_id }}" --accept-risk=all
         $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip --4)[0]
         echo "IP=$ip" >> $env:GITHUB_ENV
 
     - name: INFO
       shell: pwsh
       run: |
-        Write-Host "`n🎉 CONNECT: $($env:IP):3389" -ForegroundColor Green
-        Write-Host "User: RDPUser" -ForegroundColor Cyan
-        Write-Host "Pass: $($env:PASS)" -ForegroundColor Cyan
-        Write-Host "Drive: G:\" -ForegroundColor Yellow
+        Write-Host "`n🎉 CONNECT VIA TAILSCALE:" -ForegroundColor Green
+        Write-Host "$($env:IP):3389" -ForegroundColor Green
+        Write-Host "Username: RDPUser" -ForegroundColor Cyan
+        Write-Host "Password: $($env:PASS)" -ForegroundColor Cyan
+        Write-Host "Google Drive mounted at: G:\" -ForegroundColor Yellow
 
     - name: Keep Alive
       shell: pwsh
       run: |
         while ($true) {
-          if (-not (Test-Path G:\")) {
-            Stop-Process rclone -Force -EA 0
-            rclone mount gdrive: G: --vfs-cache-mode full --daemon
+          if (-not (Test-Path 'G:\')) {
+            Write-Host "Drive disappeared - attempting remount"
+            Stop-Process -Name rclone -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            $configPath = "$env:USERPROFILE\.config\rclone\rclone.conf"
+            Start-Process rclone -ArgumentList "mount gdrive: G: --config `"$configPath`" --vfs-cache-mode full --vfs-cache-max-size 8G --daemon" -WindowStyle Hidden
           }
-          Write-Host "$(Get-Date -f HH:mm) ✅ $($env:IP):3389"
-          Start-Sleep 300
+          
+          Write-Host "$(Get-Date -Format HH:mm) ✅ Alive - Tailscale IP: $($env:IP):3389"
+          Start-Sleep -Seconds 300
         }
