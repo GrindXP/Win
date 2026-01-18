@@ -1,196 +1,92 @@
-name: Windows RDP + Google Drive (6 Hours)
+name: Win
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
-  rdp-drive:
+  windows-rdp-setup:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-    - name: Install WinFsp
-      shell: pwsh
-      run: |
-        Write-Host "Installing WinFsp..."
-        Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile "$env:TEMP\winfsp.msi"
-        Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\winfsp.msi`" /quiet /norestart" -Wait
-        Remove-Item "$env:TEMP\winfsp.msi" -Force
-        Write-Host "✅ WinFsp Installed"
-
-    - name: Install rclone
-      shell: pwsh
-      run: |
-        Write-Host "Installing rclone..."
-        Invoke-WebRequest -Uri "https://downloads.rclone.org/v1.72.1/rclone-v1.72.1-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
-        Expand-Archive "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
-
-        $rcloneFolder = Get-ChildItem "$env:TEMP\rclone" -Directory | Select-Object -First 1
-        Copy-Item "$($rcloneFolder.FullName)\rclone.exe" "C:\Windows\System32\rclone.exe" -Force
-
-        Remove-Item "$env:TEMP\rclone" -Recurse -Force
-        Remove-Item "$env:TEMP\rclone.zip" -Force
-
-        rclone version
-        Write-Host "✅ rclone Installed"
-
-    - name: Setup Google Drive (Service Account)
-      shell: pwsh
-      env:
-        SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
-      run: |
-        $configDir = "$env:USERPROFILE\.config\rclone"
-        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-
-        # Clean JSON
-        $cleanJson = $env:SA_JSON -replace '\uFEFF','' -replace '[^\x20-\x7E\n\r\t]',''
-        $jsonPath = "$env:USERPROFILE\sa.json"
-        [IO.File]::WriteAllText($jsonPath, $cleanJson, [Text.Encoding]::UTF8)
-
-        try {
-          $test = Get-Content $jsonPath -Raw | ConvertFrom-Json
-          Write-Host "✅ SA Loaded: $($test.client_email)"
-        }
-        catch {
-          Write-Error "❌ Invalid JSON: $_"
-          exit 1
-        }
-
-        $confPath = "$configDir\rclone.conf"
-
-        # SAFE config writing (no YAML break)
-        Set-Content -Path $confPath -Encoding ascii -Value "[gdrive]"
-        Add-Content -Path $confPath -Encoding ascii -Value "type = drive"
-        Add-Content -Path $confPath -Encoding ascii -Value "scope = drive"
-        Add-Content -Path $confPath -Encoding ascii -Value "service_account_file = $jsonPath"
-
-        Write-Host "✅ rclone.conf created"
-
-    - name: Test Google Drive
-      shell: pwsh
-      run: |
-        rclone lsd gdrive:
-        Write-Host "✅ Drive connection OK"
-
-    - name: Mount Google Drive as G
-      shell: pwsh
-      run: |
-        Stop-Process -Name rclone -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-
-        $configPath = "$env:USERPROFILE\.config\rclone\rclone.conf"
-        $logPath = "$env:USERPROFILE\rclone_mount.log"
-
-        $args = @(
-          "mount", "gdrive:", "G:",
-          "--config", $configPath,
-          "--vfs-cache-mode", "full",
-          "--vfs-cache-max-size", "8G",
-          "--network-mode",
-          "--log-file", $logPath,
-          "--log-level", "INFO"
-        )
-
-        Start-Process -FilePath "rclone" -ArgumentList $args -WindowStyle Hidden
-
-        for ($i = 0; $i -lt 40; $i++) {
-          if (Test-Path "G:\") {
-            Write-Host "✅ G:\ mounted successfully"
-            Get-ChildItem "G:\" | Select-Object -First 20 | Format-Table Name
-            break
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP enabled."
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
-          Start-Sleep -Seconds 3
-        }
-
-        if (-not (Test-Path "G:\")) {
-          Write-Host "⚠️ G:\ mount not detected yet (still continuing)"
-          if (Test-Path $logPath) {
-            Write-Host "Last 60 log lines:"
-            Get-Content $logPath -Tail 60
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "✅ RDP user created."
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "✅ Tailscale installed."
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-windows-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-        }
-
-    - name: Enable RDP
-      shell: pwsh
-      run: |
-        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Restart-Service TermService -Force
-        Write-Host "✅ RDP Enabled"
-
-    - name: Create RDP User
-      shell: pwsh
-      run: |
-        $pass = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
-        $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
-
-        try {
-          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
-        } catch {
-          Write-Host "User already exists, resetting password..."
-          Set-LocalUser -Name "RDPUser" -Password $securePass
-        }
-
-        Add-LocalGroupMember -Group "Administrators" -Member "RDPUser" -ErrorAction SilentlyContinue
-        echo "PASS=$pass" >> $env:GITHUB_ENV
-
-        Write-Host "✅ User created: RDPUser"
-
-    - name: Install Tailscale
-      shell: pwsh
-      env:
-        TSKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      run: |
-        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\ts.msi"
-        Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet /norestart" -Wait
-        Remove-Item "$env:TEMP\ts.msi" -Force
-
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TSKEY --hostname="gh-rdp-${{ github.run_id }}" --accept-risk=all
-        $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip --4)[0]
-
-        echo "IP=$ip" >> $env:GITHUB_ENV
-        Write-Host "✅ Tailscale IP: $ip"
-
-    - name: INFO
-      shell: pwsh
-      run: |
-        Write-Host ""
-        Write-Host "🎉 CONNECT VIA TAILSCALE:" -ForegroundColor Green
-        Write-Host "$($env:IP):3389" -ForegroundColor Green
-        Write-Host "Username: RDPUser" -ForegroundColor Cyan
-        Write-Host "Password: $($env:PASS)" -ForegroundColor Cyan
-        Write-Host "Google Drive mounted at: G:\" -ForegroundColor Yellow
-        Write-Host ""
-
-    - name: Keep Alive (6 Hours)
-      shell: pwsh
-      run: |
-        $minutes = 360
-        $configPath = "$env:USERPROFILE\.config\rclone\rclone.conf"
-        $logPath = "$env:USERPROFILE\rclone_mount.log"
-
-        for ($m=1; $m -le $minutes; $m++) {
-
-          if (-not (Test-Path "G:\")) {
-            Write-Host "⚠️ Drive disappeared! Remounting..."
-            Stop-Process -Name rclone -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-
-            $args = @(
-              "mount", "gdrive:", "G:",
-              "--config", $configPath,
-              "--vfs-cache-mode", "full",
-              "--vfs-cache-max-size", "8G",
-              "--network-mode",
-              "--log-file", $logPath,
-              "--log-level", "INFO"
-            )
-
-            Start-Process -FilePath "rclone" -ArgumentList $args -WindowStyle Hidden
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."
+              exit 1
           }
-
-          Write-Host "$(Get-Date -Format HH:mm:ss) ✅ Alive | Remaining: $($minutes-$m) min | IP: $($env:IP):3389"
-          Start-Sleep -Seconds 60
-        }
-
-        Write-Host "✅ Finished 6 hours. Workflow ending."
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $tsIP."
+      - name: Display Access Info
+        shell: pwsh
+        run: |
+          Write-Host "╔══════════════════════════════════════════╗"
+          Write-Host "║  🖥️ RDP: $env:TAILSCALE_IP:3389          ║"
+          Write-Host "║  👤 Username: RDP                         ║"
+          Write-Host "║  🔑 Password: $(echo $env:RDP_CREDS | ForEach-Object { $_.Split('|')[-1].Trim() }) ║"
+          Write-Host "╚══════════════════════════════════════════╝"
+          Write-Host "Connect via RDP client to access Windows GUI."
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP SESSION ACTIVE ==="
+          while ($true) {
+              $rdpSvc = Get-Service TermService
+              if ($rdpSvc.Status -ne "Running") { Start-Service TermService }
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($tsStatus -notmatch "Logged in") { & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} }
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - RDP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 300
+          }
